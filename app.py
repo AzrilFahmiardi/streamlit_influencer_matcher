@@ -2,6 +2,24 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 
+# Pindahkan st.set_page_config ke posisi paling atas,
+# setelah semua import library dasar.
+st.set_page_config(page_title="Brand Influencer Recommendation", layout="wide") # Di sini perbaikannya
+
+# Gaya CSS untuk kerapihan
+st.markdown(
+    """
+    <style>
+    .st-emotion-cache-1v0mbdj {padding-top: 1rem;}
+    .divider {border-top: 2px solid #eee; margin: 1.5em 0;}
+    .section-card {background: #f8f9fa; border-radius: 10px; padding: 1.2em 1.5em; margin-bottom: 1.5em;}
+    .score-badge {display:inline-block; background:#1DA1F2; color:white; border-radius:8px; padding:0.2em 0.7em; font-size:1em;}
+    </style>
+    """, unsafe_allow_html=True
+)
+
+st.title("🎯 Brand Influencer Recommendation & Insight")
+
 # --- Load Data ---
 @st.cache_data
 def load_data():
@@ -43,12 +61,12 @@ def generate_brand_summary(df, brand_name):
     summary = f"""
 **🧠 BRAND PROFILE: {row['brand_name'].title()}**
 
-| 🎯 Target Persona |  |  |  |  |  |
+| 🎯 Target Persona | | | | | |
 |:--|:--|:--|:--|:--|:--|
 | **Gender** | **Age Group** | **Income** | **Lifestyle** | **Personality** | **Core Values** |
 | {gender} | {age_group} | {income} | {lifestyle} | {personality} | {values} |
 
-| 📈 Brand Objective |  |  |  |
+| 📈 Brand Objective | | | |
 |:--|:--|:--|:--|
 | **Growth Type** | **Marketing Goal** | **Budget** | **Criteria** |
 | {growth_type} | {marketing_goal} | {budget} | {criteria} |
@@ -141,9 +159,11 @@ def generate_influencer_insight(username, caption_df, comment_df, show_plot=Fals
         result_lines.append("_Tidak ada caption yang dapat dianalisis._")
 
     # Optional: plot (Streamlit native, not matplotlib)
-    import streamlit as st
-    import pandas as pd
+    # Import Streamlit dan Pandas sudah dilakukan di awal file, tidak perlu di sini lagi
+    # import streamlit as st
+    # import pandas as pd
 
+    fig = None # Inisialisasi fig agar selalu ada return value
     if show_plot:
         plot_cols = st.columns(2)
         # Caption label distribution (bar chart)
@@ -174,11 +194,15 @@ def generate_influencer_insight(username, caption_df, comment_df, show_plot=Fals
                 st.markdown("_No Comment Data_")
 
     # Gabungkan semua lines dengan newline agar markdown table tetap rapi
-    return "\n\n".join(result_lines), None
+    return "\n\n".join(result_lines), fig # Pastikan fig selalu dikembalikan
 
 # --- SOTA Pipeline dari notebook ---
 # Salin class-class pipeline dari notebook ke sini agar hasil scoring & ranking AKURAT.
 from typing import List
+
+# Import warnings di bagian paling atas atau di sini jika hanya digunakan oleh pipeline
+import warnings
+warnings.filterwarnings('ignore')
 
 # --- Mulai dari sini: copy class dari notebook ---
 import cvxpy as cp
@@ -188,8 +212,7 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics.pairwise import cosine_similarity
 from pulp import LpProblem, LpMaximize, LpVariable, lpSum, LpInteger
-import warnings
-warnings.filterwarnings('ignore')
+
 
 class BudgetOptimizer:
     def __init__(self):
@@ -426,6 +449,7 @@ class SOTAInfluencerMatcher:
         self.final_ranker = MultiObjectiveRanker()
 
 # --- Ganti fungsi utama dengan pipeline notebook ---
+@st.cache_data # Tambahkan cache untuk fungsi ini jika hasilnya deterministik dan berat
 def get_top_influencers_for_brand(brand_name, brands_df, influencers_df, bio_df, caption_df, top_n=3):
     matcher = SOTAInfluencerMatcher()
     brand_data = brands_df[brands_df['brand_name'] == brand_name]
@@ -485,19 +509,7 @@ def get_top_influencers_for_brand(brand_name, brands_df, influencers_df, bio_df,
     top_recommendations = final_rankings[:top_n]
     return top_recommendations
 
-# --- Streamlit Layout ---
-st.set_page_config(page_title="Brand Influencer Recommendation", layout="wide")
-st.markdown(
-    """
-    <style>
-    .st-emotion-cache-1v0mbdj {padding-top: 1rem;}
-    .divider {border-top: 2px solid #eee; margin: 1.5em 0;}
-    .section-card {background: #f8f9fa; border-radius: 10px; padding: 1.2em 1.5em; margin-bottom: 1.5em;}
-    .score-badge {display:inline-block; background:#1DA1F2; color:white; border-radius:8px; padding:0.2em 0.7em; font-size:1em;}
-    </style>
-    """, unsafe_allow_html=True
-)
-st.title("🎯 Brand Influencer Recommendation & Insight")
+# --- Streamlit Layout & Interaction ---
 
 with st.sidebar:
     st.header("Brand Selection")
@@ -505,13 +517,12 @@ with st.sidebar:
     top_n = st.slider("Top N Influencer", 1, 5, 3)
     show_detail = st.checkbox("Tampilkan detail proses", value=True)
 
-# --- Main Output ---
+# --- Main Output Trigger ---
 if st.button("Tampilkan Rekomendasi"):
     with st.spinner("🔎 Mencari influencer terbaik..."):
         # --- Proses ---
         st.markdown(f"""
-**🎯 Finding top {top_n} influencers for: {brand_name}**  
-**💰 Budget:** Rp {int(brands[brands['brand_name']==brand_name]['budget'].iloc[0]):,}  
+**🎯 Finding top {top_n} influencers for: {brand_name}** **💰 Budget:** Rp {int(brands[brands['brand_name']==brand_name]['budget'].iloc[0]):,}  
 **🎪 Industry:** {brands[brands['brand_name']==brand_name]['industry'].iloc[0]}  
 **📝 Criteria:** {brands[brands['brand_name']==brand_name]['brand_criteria'].iloc[0]}  
 {'-'*60}
@@ -551,7 +562,7 @@ if st.button("Tampilkan Rekomendasi"):
                     show_plot=True
                 )
                 st.markdown(insight, unsafe_allow_html=True)
-                if fig:
+                if fig: # Hanya panggil st.pyplot jika fig memang ada
                     st.pyplot(fig, clear_figure=True)
                 # Tabs for detail
                 with st.expander("🔎 Detail & Metrics"):
@@ -597,8 +608,8 @@ if st.button("Tampilkan Rekomendasi"):
                             st.write(f"- Reels: {mix['reels_count']} posts")
                         st.markdown("**💳 Financial Summary:**")
                         st.markdown(f"""
-- Total Investment:      Rp {mix['total_cost']:,}  
-- Budget Remaining:      Rp {mix['remaining_budget']:,}  
-- Expected Impact:       {mix['total_impact']:.1f} points
+- Total Investment:     Rp {mix['total_cost']:,}  
+- Budget Remaining:     Rp {mix['remaining_budget']:,}  
+- Expected Impact:      {mix['total_impact']:.1f} points
 """)
         st.markdown(f"<div class='divider'></div>", unsafe_allow_html=True)
