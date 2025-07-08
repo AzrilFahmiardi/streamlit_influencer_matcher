@@ -1,12 +1,14 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import cvxpy as cp
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+from pulp import LpProblem, LpMaximize, LpVariable, lpSum, LpInteger, LpBinary
+import warnings
+warnings.filterwarnings('ignore')
 
-# Pindahkan st.set_page_config ke posisi paling atas,
-# setelah semua import library dasar.
-st.set_page_config(page_title="Brand Influencer Recommendation", layout="wide") # Di sini perbaikannya
-
-# Gaya CSS untuk kerapihan
+st.set_page_config(page_title="Brand Influencer Recommendation", layout="wide")
 st.markdown(
     """
     <style>
@@ -17,7 +19,6 @@ st.markdown(
     </style>
     """, unsafe_allow_html=True
 )
-
 st.title("🎯 Brand Influencer Recommendation & Insight")
 
 # --- Load Data ---
@@ -28,10 +29,479 @@ def load_data():
     labeled_caption = pd.read_csv("https://raw.githubusercontent.com/Fahmi-mi/Dataset/refs/heads/main/datathon-ristek-ui-2025/input_instagram_brands/labeled_caption.csv")
     labeled_comment = pd.read_csv("https://raw.githubusercontent.com/Fahmi-mi/Dataset/refs/heads/main/datathon-ristek-ui-2025/input_instagram_brands/labeled_comment.csv")
     bio = pd.read_csv("https://raw.githubusercontent.com/Fahmi-mi/Dataset/refs/heads/main/datathon-ristek-ui-2025/instagram/bio.csv")
-    return brands, influencers, labeled_caption, labeled_comment, bio
+    captions = pd.read_csv("https://raw.githubusercontent.com/Fahmi-mi/Dataset/refs/heads/main/datathon-ristek-ui-2025/instagram/captions.csv")
+    return brands, influencers, labeled_caption, labeled_comment, bio, captions
 
-brands, influencers, labeled_caption, labeled_comment, bio = load_data()
+brands, influencers, labeled_caption, labeled_comment, bio, captions = load_data()
 
+# --- SOTA Pipeline Classes (Exact copy from notebook) ---
+
+class BudgetOptimizer:
+    def __init__(self):
+        pass
+
+    def filter_and_optimize(self, brand_budget, influencers_df):
+        """Filter influencers by budget + find optimal content mix"""
+        filtered_influencers = []
+
+        for _, infl in influencers_df.iterrows():
+            # Check if any single content type is affordable
+            if (brand_budget >= infl['rate_card_story'] or
+                brand_budget >= infl['rate_card_feeds'] or
+                brand_budget >= infl['rate_card_reels']):
+
+                # Calculate optimal content mix
+                optimal_mix = self.optimize_content_mix(
+                    budget=brand_budget,
+                    story_rate=infl['rate_card_story'],
+                    feeds_rate=infl['rate_card_feeds'],
+                    reels_rate=infl['rate_card_reels'],
+                    story_impact=self.estimate_story_impact(infl),
+                    feeds_impact=self.estimate_feeds_impact(infl),
+                    reels_impact=self.estimate_reels_impact(infl)
+                )
+
+                infl_dict = infl.to_dict()
+                infl_dict.update({
+                    'optimal_content_mix': optimal_mix,
+                    'budget_efficiency': optimal_mix['total_impact'] / optimal_mix['total_cost'] if optimal_mix['total_cost'] > 0 else 0
+                })
+                filtered_influencers.append(infl_dict)
+
+        return pd.DataFrame(filtered_influencers)
+
+    def optimize_content_mix(self, budget, story_rate, feeds_rate, reels_rate, story_impact, feeds_impact, reels_impact):
+        prob = LpProblem("OptimalContentMix", LpMaximize)
+
+        x = LpVariable("story_count", 0, 5, cat=LpInteger)
+        y = LpVariable("feeds_count", 0, 4, cat=LpInteger)
+        z = LpVariable("reels_count", 0, 3, cat=LpInteger)
+
+        use_story = LpVariable("use_story", 0, 1, LpBinary)
+        use_feeds = LpVariable("use_feeds", 0, 1, LpBinary)
+        use_reels = LpVariable("use_reels", 0, 1, LpBinary)
+
+        # Budget constraint
+        prob += story_rate * x + feeds_rate * y + reels_rate * z <= budget
+
+        # Activation constraints (relaksasi)
+        prob += x >= 1 * use_story
+        prob += x <= 1000 * use_story
+
+        prob += y >= 1 * use_feeds
+        prob += y <= 1000 * use_feeds
+
+        prob += z >= 1 * use_reels
+        prob += z <= 1000 * use_reels
+
+        # Objective with diversity bonus
+        diversity_bonus = 5 * (use_story + use_feeds + use_reels)
+        prob += story_impact * x + feeds_impact * y + reels_impact * z + diversity_bonus
+
+        prob.solve()
+
+        # Handle null values from solver - NOTEBOOK VERSION
+        story_count = int(x.varValue) if x.varValue is not None else 0
+        feeds_count = int(y.varValue) if y.varValue is not None else 0
+        reels_count = int(z.varValue) if z.varValue is not None else 0
+
+        total_cost = story_count * story_rate + feeds_count * feeds_rate + reels_count * reels_rate
+        total_impact = story_count * story_impact + feeds_count * feeds_impact + reels_count * reels_impact
+        remaining_budget = budget - total_cost
+
+        return {
+            'story_count': story_count,
+            'feeds_count': feeds_count,
+            'reels_count': reels_count,
+            'total_cost': total_cost,
+            'total_impact': total_impact,
+            'remaining_budget': remaining_budget
+        }
+
+    def estimate_story_impact(self, influencer):
+        """Estimate impact score for Instagram Story"""
+        base_impact = influencer.get('engagement_rate_pct', 0.02) * 100
+        tier_multiplier = {
+            'Nano': 1.2, 'Micro': 1.1, 'Mid': 1.0, 'Macro': 0.9, 'Mega': 0.8
+        }.get(influencer.get('tier_followers', 'Micro'), 1.0)
+        return base_impact * tier_multiplier * 0.7
+
+    def estimate_feeds_impact(self, influencer):
+        """Estimate impact score for Instagram Feeds"""
+        base_impact = influencer.get('engagement_rate_pct', 0.02) * 100
+        tier_multiplier = {
+            'Nano': 1.2, 'Micro': 1.1, 'Mid': 1.0, 'Macro': 0.9, 'Mega': 0.8
+        }.get(influencer.get('tier_followers', 'Micro'), 1.0)
+        return base_impact * tier_multiplier * 1.0
+
+    def estimate_reels_impact(self, influencer):
+        """Estimate impact score for Instagram Reels"""
+        base_impact = influencer.get('engagement_rate_pct', 0.02) * 100
+        viral_bonus = 1.5 if influencer.get('trending_status', False) else 1.2
+        tier_multiplier = {
+            'Nano': 1.3, 'Micro': 1.2, 'Mid': 1.1, 'Macro': 1.0, 'Mega': 0.9
+        }.get(influencer.get('tier_followers', 'Micro'), 1.0)
+        return base_impact * tier_multiplier * viral_bonus
+
+class PersonaSemanticMatcher:
+    def __init__(self, model_name='paraphrase-multilingual-MiniLM-L12-v2'):
+        try:
+            self.model = SentenceTransformer(model_name)
+            self.use_semantic = True
+        except:
+            # Fallback jika tidak bisa load model
+            self.model = None
+            self.use_semantic = False
+            st.warning("⚠️ SentenceTransformer tidak dapat dimuat. Menggunakan scoring acak untuk persona matching.")
+
+    def prepare_influencer_texts(self, bio_df, caption_df, max_posts=5):
+        """
+        Gabungkan bio dengan caption terakhir per influencer.
+        """
+        influencer_texts = {}
+        grouped_captions = caption_df.groupby('instagram_account')
+
+        for _, row in bio_df.iterrows():
+            account = row['instagram_account']
+            bio = str(row['bio']) if pd.notna(row['bio']) else ""
+
+            captions = []
+            if account in grouped_captions.groups:
+                captions_raw = grouped_captions.get_group(account)['post_caption'].head(max_posts)
+                captions = [str(c) for c in captions_raw if pd.notna(c)]
+
+            full_text = bio + ' ' + ' '.join(captions)
+            influencer_texts[account] = full_text.strip()
+
+        return influencer_texts
+
+    def calculate_similarity_scores(self, brand_persona_text, influencer_texts):
+        """
+        Hitung cosine similarity antara brand persona dan teks masing-masing influencer.
+        """
+        if not self.use_semantic:
+            # Fallback: return random scores
+            np.random.seed(42)
+            return {account: np.random.uniform(0.4, 0.7) for account in influencer_texts.keys()}
+
+        scores = {}
+        brand_vec = self.model.encode(brand_persona_text)
+
+        accounts = list(influencer_texts.keys())
+        texts = list(influencer_texts.values())
+
+        infl_vecs = self.model.encode(texts, show_progress_bar=False)
+        cosine_scores = cosine_similarity([brand_vec], infl_vecs)[0]
+        scores = dict(zip(accounts, cosine_scores))
+
+        return scores
+
+    def get_scored_df(self, brand_persona_text, bio_df, caption_df):
+        """
+        Mengembalikan DataFrame berisi akun influencer dan skor kecocokan persona.
+        """
+        influencer_texts = self.prepare_influencer_texts(bio_df, caption_df)
+        scores = self.calculate_similarity_scores(brand_persona_text, influencer_texts)
+        return pd.DataFrame([
+            {'instagram_account': account, 'persona_fit_score': score}
+            for account, score in scores.items()
+        ])
+
+class DemoPsychoMatcher:
+    def __init__(self):
+        self.demo_weights = {
+            'demography_usia': 0.3,
+            'demography_gender': 0.25,
+            'demography_income': 0.2,
+            'psychography_lifestyle': 0.15,
+            'psychography_personality': 0.1
+        }
+
+    def calculate_demographic_similarity(self, brand_demo, influencer_demo):
+        """Calculate weighted demographic similarity score"""
+        total_score = 0
+        total_weight = 0
+
+        for field, weight in self.demo_weights.items():
+            brand_values = self.parse_list_field(brand_demo.get(field, []))
+            infl_values = self.parse_list_field(influencer_demo.get(field, []))
+
+            if brand_values and infl_values:
+                intersection = len(set(brand_values) & set(infl_values))
+                union = len(set(brand_values) | set(infl_values))
+                jaccard_sim = intersection / union if union > 0 else 0
+                total_score += weight * jaccard_sim
+                total_weight += weight
+
+        return total_score / total_weight if total_weight > 0 else 0
+
+    def parse_list_field(self, field_value):
+        """Parse string representation of list"""
+        if isinstance(field_value, str):
+            try:
+                if field_value.startswith('[') and field_value.endswith(']'):
+                    return eval(field_value)
+                else:
+                    return [field_value]
+            except:
+                return [field_value]
+        elif isinstance(field_value, list):
+            return field_value
+        else:
+            return [str(field_value)] if field_value is not None else []
+
+class SocialMediaPerformancePredictor:
+    def __init__(self):
+        # Simple heuristic-based predictor (no ML models to avoid complexity)
+        self.tier_benchmarks = {
+            'Nano': {'engagement': 0.04, 'views': 5000},
+            'Micro': {'engagement': 0.02, 'views': 25000},
+            'Mid': {'engagement': 0.015, 'views': 75000},
+            'Macro': {'engagement': 0.012, 'views': 200000},
+            'Mega': {'engagement': 0.01, 'views': 500000}
+        }
+        # Try to load sentence transformer model like in notebook
+        try:
+            from sentence_transformers import SentenceTransformer, util
+            self.model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
+            self.use_semantic = True
+            self.util = util
+        except:
+            self.model = None
+            self.use_semantic = False
+
+    def predict_campaign_performance(self, influencer_data, brand_data):
+        """Predict campaign performance using heuristic approach"""
+        # Calculate performance components
+        engagement_score = self.calculate_engagement_score(influencer_data)
+        authenticity_score = self.calculate_authenticity_score(influencer_data)
+        reach_potential = self.calculate_reach_potential(influencer_data)
+        brand_fit = self.calculate_brand_fit(influencer_data, brand_data)
+
+        # Combined performance score
+        performance_score = (
+            engagement_score * 0.3 +
+            authenticity_score * 0.25 +
+            reach_potential * 0.25 +
+            brand_fit * 0.2
+        )
+
+        return {
+            'performance_score': min(performance_score, 1.0),
+            'engagement_score': engagement_score,
+            'authenticity_score': authenticity_score,
+            'reach_potential': reach_potential,
+            'brand_fit': brand_fit
+        }
+
+    def calculate_engagement_score(self, influencer_data):
+        """Calculate engagement quality score"""
+        er = influencer_data.get('engagement_rate_pct', 0)
+        tier = influencer_data.get('tier_followers', 'Micro')
+        benchmark = self.tier_benchmarks.get(tier, {'engagement': 0.02})['engagement']
+
+        normalized_er = min(er / benchmark, 2.0) if benchmark > 0 else 0
+        return normalized_er / 2.0
+
+    def calculate_authenticity_score(self, influencer_data):
+        """Calculate authenticity based on endorse rate and consistency"""
+        endorse_rate = influencer_data.get('random_endorse_rate', 0.5)
+        consistency = influencer_data.get('behavior_consistency', False)
+
+        authenticity = (1 - endorse_rate) * 0.7
+        if consistency:
+            authenticity += 0.3
+
+        return min(authenticity, 1.0)
+
+    def calculate_reach_potential(self, influencer_data):
+        """Calculate reach potential based on views and virality"""
+        avg_views = influencer_data.get('avg_reels_views', 0)
+        trending = influencer_data.get('trending_status', False)
+        tier = influencer_data.get('tier_followers', 'Micro')
+
+        benchmark = self.tier_benchmarks.get(tier, {'views': 25000})['views']
+        view_score = min(avg_views / benchmark, 2.0) / 2.0 if benchmark > 0 else 0
+
+        if trending:
+            view_score *= 1.2
+
+        return min(view_score, 1.0)
+
+    def calculate_brand_fit(self, influencer_data, brand_data):
+        """Calculate brand fit using sentence embeddings and cosine similarity (NOTEBOOK VERSION)"""
+        if self.use_semantic:
+            infl_text = influencer_data.get('expertise_field', '')
+            brand_text = brand_data.get('industry_description', brand_data.get('industry', ''))
+
+            if not infl_text or not brand_text:
+                return 0.0  # Fallback jika data kosong
+
+            try:
+                emb_influencer = self.model.encode(infl_text, convert_to_tensor=True)
+                emb_brand = self.model.encode(brand_text, convert_to_tensor=True)
+
+                score = self.util.cos_sim(emb_influencer, emb_brand).item()
+                return min(max(score, 0.0), 1.0)
+            except:
+                # Fallback to keyword matching if semantic fails
+                pass
+        
+        # Fallback: keyword matching (original implementation)
+        infl_expertise = influencer_data.get('expertise_field', '').lower()
+        brand_industry = brand_data.get('industry', '').lower()
+
+        industry_keywords = {
+            'fmcg': ['lifestyle', 'beauty', 'food', 'health'],
+            'beauty': ['beauty', 'skincare', 'makeup', 'lifestyle'],
+            'health': ['health', 'fitness', 'lifestyle', 'wellness'],
+            'fashion': ['fashion', 'lifestyle', 'beauty'],
+            'food': ['food', 'lifestyle', 'cooking']
+        }
+
+        relevant_keywords = industry_keywords.get(brand_industry, ['lifestyle'])
+
+        if infl_expertise in relevant_keywords:
+            return 0.8
+        elif 'lifestyle' in infl_expertise:
+            return 0.6
+        else:
+            return 0.4
+
+class MultiObjectiveRanker:
+    def __init__(self):
+        self.main_objectives = ['demo_fit', 'performance_pred', 'budget_efficiency']
+        self.placeholder_objectives = ['persona_fit']
+
+    def rank_influencers(self, scored_influencers, brand_priorities):
+        if not scored_influencers:
+            return []
+
+        # Normalize main objectives
+        for obj in self.main_objectives:
+            scores = [infl[obj] for infl in scored_influencers]
+            if scores:  # Check if list is not empty
+                min_score, max_score = min(scores), max(scores)
+                for infl in scored_influencers:
+                    if max_score > min_score:
+                        infl[f'{obj}_normalized'] = (infl[obj] - min_score) / (max_score - min_score)
+                    else:
+                        infl[f'{obj}_normalized'] = 0.5
+
+        # Handle placeholder objectives
+        for obj in self.placeholder_objectives:
+            for infl in scored_influencers:
+                infl[f'{obj}_normalized'] = infl[obj]
+
+        # Calculate weighted final score
+        all_objectives = self.main_objectives + self.placeholder_objectives
+        for infl in scored_influencers:
+            final_score = sum(
+                infl[f'{obj}_normalized'] * brand_priorities.get(obj, 0.25)
+                for obj in all_objectives
+            )
+            infl['final_score'] = final_score
+
+        return sorted(scored_influencers, key=lambda x: x['final_score'], reverse=True)
+
+class SOTAInfluencerMatcher:
+    def __init__(self):
+        self.budget_optimizer = BudgetOptimizer()
+        self.persona_matcher = PersonaSemanticMatcher()
+        self.demo_psycho_matcher = DemoPsychoMatcher()
+        self.performance_predictor = SocialMediaPerformancePredictor()
+        self.final_ranker = MultiObjectiveRanker()
+
+# --- Main function (Exact copy from notebook) ---
+def get_top_influencers_for_brand(brand_name, brands_df, influencers_df, bio_df, caption_df, top_n=3):
+    """
+    Get top N influencer recommendations for a specific brand using SOTA pipeline
+    """
+    matcher = SOTAInfluencerMatcher()
+
+    # Get brand data
+    brand_data = brands_df[brands_df['brand_name'] == brand_name]
+    if brand_data.empty:
+        return []
+
+    brand = brand_data.iloc[0]
+
+    # Stage 1: Budget filtering
+    affordable_influencers = matcher.budget_optimizer.filter_and_optimize(
+        brand['budget'], influencers_df
+    )
+
+    if affordable_influencers.empty:
+        return []
+
+    # Stage 2: Persona matching
+    persona_scores_df = matcher.persona_matcher.get_scored_df(
+        brand_persona_text=brand['brand_criteria'],
+        bio_df=bio_df[['instagram_account', 'bio']],
+        caption_df=caption_df
+    )
+
+    # Merge persona_fit score ke affordable influencers
+    affordable_influencers = pd.merge(
+        affordable_influencers,
+        persona_scores_df.rename(columns={'persona_fit_score': 'persona_fit'}),
+        left_on='username_instagram',
+        right_on='instagram_account',
+        how='left'
+    )
+
+    affordable_influencers['persona_fit'] = affordable_influencers['persona_fit'].fillna(0.5)
+
+    # Score all affordable influencers
+    scored_influencers = []
+
+    for _, infl in affordable_influencers.iterrows():
+        # Stage 2: Persona matching
+        persona_score = infl.get('persona_fit', 0.5)
+
+        # Stage 3: Demo/psychographic matching
+        demo_score = matcher.demo_psycho_matcher.calculate_demographic_similarity(
+            brand.to_dict(), infl.to_dict()
+        )
+
+        # Stage 4: Performance prediction
+        performance = matcher.performance_predictor.predict_campaign_performance(
+            infl.to_dict(), brand.to_dict()
+        )
+
+        scored_influencers.append({
+            'brand': brand['brand_name'],
+            'influencer': infl['username_instagram'],
+            'influencer_id': infl['influencer_id'],
+            'tier': infl['tier_followers'],
+            'persona_fit': persona_score,
+            'demo_fit': demo_score,
+            'performance_pred': performance['performance_score'],
+            'budget_efficiency': infl['budget_efficiency'],
+            'optimal_content_mix': infl['optimal_content_mix'],
+            'engagement_rate': infl['engagement_rate_pct'],
+            'authenticity_score': performance['authenticity_score'],
+            'reach_potential': performance['reach_potential'],
+            'brand_fit': performance['brand_fit'],
+            # Raw influencer data for detailed insights
+            'raw_influencer_data': infl.to_dict(),
+            'final_score': 0  # Will be calculated in ranking
+        })
+
+    # Stage 5: Final ranking with exact notebook priorities
+    brand_priorities = {
+        'persona_fit': 0.1,       # Reduced since placeholder (NOTEBOOK VERSION)
+        'demo_fit': 0.45,         # High importance
+        'performance_pred': 0.35, # High importance
+        'budget_efficiency': 0.1  # Budget optimization
+    }
+
+    final_rankings = matcher.final_ranker.rank_influencers(scored_influencers, brand_priorities)
+
+    # Return top N
+    top_recommendations = final_rankings[:top_n]
+
+    return top_recommendations
 
 def generate_brand_summary(df, brand_name):
     import ast
@@ -61,12 +531,12 @@ def generate_brand_summary(df, brand_name):
     summary = f"""
 **🧠 BRAND PROFILE: {row['brand_name'].title()}**
 
-| 🎯 Target Persona | | | | | |
+| 🎯 Target Persona |  |  |  |  |  |
 |:--|:--|:--|:--|:--|:--|
 | **Gender** | **Age Group** | **Income** | **Lifestyle** | **Personality** | **Core Values** |
 | {gender} | {age_group} | {income} | {lifestyle} | {personality} | {values} |
 
-| 📈 Brand Objective | | | |
+| 📈 Brand Objective |  |  |  |
 |:--|:--|:--|:--|
 | **Growth Type** | **Marketing Goal** | **Budget** | **Criteria** |
 | {growth_type} | {marketing_goal} | {budget} | {criteria} |
@@ -159,11 +629,9 @@ def generate_influencer_insight(username, caption_df, comment_df, show_plot=Fals
         result_lines.append("_Tidak ada caption yang dapat dianalisis._")
 
     # Optional: plot (Streamlit native, not matplotlib)
-    # Import Streamlit dan Pandas sudah dilakukan di awal file, tidak perlu di sini lagi
-    # import streamlit as st
-    # import pandas as pd
+    import streamlit as st
+    import pandas as pd
 
-    fig = None # Inisialisasi fig agar selalu ada return value
     if show_plot:
         plot_cols = st.columns(2)
         # Caption label distribution (bar chart)
@@ -194,335 +662,26 @@ def generate_influencer_insight(username, caption_df, comment_df, show_plot=Fals
                 st.markdown("_No Comment Data_")
 
     # Gabungkan semua lines dengan newline agar markdown table tetap rapi
-    return "\n\n".join(result_lines), fig # Pastikan fig selalu dikembalikan
+    return "\n\n".join(result_lines), None
 
-# --- SOTA Pipeline dari notebook ---
-# Salin class-class pipeline dari notebook ke sini agar hasil scoring & ranking AKURAT.
-from typing import List
-
-# Import warnings di bagian paling atas atau di sini jika hanya digunakan oleh pipeline
-import warnings
-warnings.filterwarnings('ignore')
-
-# --- Mulai dari sini: copy class dari notebook ---
-import cvxpy as cp
-from sentence_transformers import SentenceTransformer
-from scipy.optimize import linprog
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics.pairwise import cosine_similarity
-from pulp import LpProblem, LpMaximize, LpVariable, lpSum, LpInteger
+# --- SOTA Pipeline Classes (Exact copy from notebook) ---
 
 
-class BudgetOptimizer:
-    def __init__(self):
-        pass
 
-    def filter_and_optimize(self, brand_budget, influencers_df):
-        filtered_influencers = []
-        for _, infl in influencers_df.iterrows():
-            if (brand_budget >= infl['rate_card_story'] or
-                brand_budget >= infl['rate_card_feeds'] or
-                brand_budget >= infl['rate_card_reels']):
-                optimal_mix = self.optimize_content_mix(
-                    budget=brand_budget,
-                    story_rate=infl['rate_card_story'],
-                    feeds_rate=infl['rate_card_feeds'],
-                    reels_rate=infl['rate_card_reels'],
-                    story_impact=self.estimate_story_impact(infl),
-                    feeds_impact=self.estimate_feeds_impact(infl),
-                    reels_impact=self.estimate_reels_impact(infl)
-                )
-                infl_dict = infl.to_dict()
-                infl_dict.update({
-                    'optimal_content_mix': optimal_mix,
-                    'budget_efficiency': optimal_mix['total_impact'] / optimal_mix['total_cost'] if optimal_mix['total_cost'] > 0 else 0
-                })
-                filtered_influencers.append(infl_dict)
-        return pd.DataFrame(filtered_influencers)
-
-    def optimize_content_mix(self, budget, story_rate, feeds_rate, reels_rate, story_impact, feeds_impact, reels_impact):
-        prob = LpProblem("OptimalContentMix", LpMaximize)
-        x = LpVariable("story_count", 0, cat=LpInteger)
-        y = LpVariable("feeds_count", 0, cat=LpInteger)
-        z = LpVariable("reels_count", 0, cat=LpInteger)
-        prob += story_impact * x + feeds_impact * y + reels_impact * z
-        prob += story_rate * x + feeds_rate * y + reels_rate * z <= budget
-        prob.solve()
-        story_count = int(x.varValue)
-        feeds_count = int(y.varValue)
-        reels_count = int(z.varValue)
-        total_cost = story_count * story_rate + feeds_count * feeds_rate + reels_count * reels_rate
-        total_impact = story_count * story_impact + feeds_count * feeds_impact + reels_count * reels_impact
-        remaining_budget = budget - total_cost
-        return {
-            'story_count': story_count,
-            'feeds_count': feeds_count,
-            'reels_count': reels_count,
-            'total_cost': total_cost,
-            'total_impact': total_impact,
-            'remaining_budget': remaining_budget
-        }
-
-    def estimate_story_impact(self, influencer):
-        base_impact = influencer.get('engagement_rate_pct', 0.02) * 100
-        tier_multiplier = {
-            'Nano': 1.2, 'Micro': 1.1, 'Mid': 1.0, 'Macro': 0.9, 'Mega': 0.8,
-        }.get(influencer.get('tier_followers', 'Micro'), 1.0)
-        return base_impact * tier_multiplier * 0.7
-
-    def estimate_feeds_impact(self, influencer):
-        base_impact = influencer.get('engagement_rate_pct', 0.02) * 100
-        tier_multiplier = {
-            'Nano': 1.2, 'Micro': 1.1, 'Mid': 1.0, 'Macro': 0.9, 'Mega': 0.8,
-        }.get(influencer.get('tier_followers', 'Micro'), 1.0)
-        return base_impact * tier_multiplier * 1.0
-
-    def estimate_reels_impact(self, influencer):
-        base_impact = influencer.get('engagement_rate_pct', 0.02) * 100
-        viral_bonus = 1.5 if influencer.get('trending_status', False) else 1.2
-        tier_multiplier = {
-            'Nano': 1.3, 'Micro': 1.2, 'Mid': 1.1, 'Macro': 1.0, 'Mega': 0.9,
-        }.get(influencer.get('tier_followers', 'Micro'), 1.0)
-        return base_impact * tier_multiplier * viral_bonus
-
-class PersonaSemanticMatcher:
-    def __init__(self, model_name=None):
-        # Fallback: use random or simple string matching for persona_fit if RAM is low
-        self.model = None  # Do not load SentenceTransformer
-
-    def get_scored_df(self, brand_persona_text, bio_df, caption_df):
-        # Simple fallback: assign random or constant persona_fit
-        np.random.seed(42)
-        accounts = bio_df['instagram_account'].tolist()
-        scores = np.random.uniform(0.4, 0.7, size=len(accounts))
-        return pd.DataFrame([
-            {'instagram_account': account, 'persona_fit_score': score}
-            for account, score in zip(accounts, scores)
-        ])
-
-class DemoPsychoMatcher:
-    def __init__(self):
-        self.demo_weights = {
-            'demography_usia': 0.3,
-            'demography_gender': 0.25,
-            'demography_income': 0.2,
-            'psychography_lifestyle': 0.15,
-            'psychography_personality': 0.1
-        }
-
-    def calculate_demographic_similarity(self, brand_demo, influencer_demo):
-        total_score = 0
-        total_weight = 0
-        for field, weight in self.demo_weights.items():
-            brand_values = self.parse_list_field(brand_demo.get(field, []))
-            infl_values = self.parse_list_field(influencer_demo.get(field, []))
-            if brand_values and infl_values:
-                intersection = len(set(brand_values) & set(infl_values))
-                union = len(set(brand_values) | set(infl_values))
-                jaccard_sim = intersection / union if union > 0 else 0
-                total_score += weight * jaccard_sim
-                total_weight += weight
-        return total_score / total_weight if total_weight > 0 else 0
-
-    def parse_list_field(self, field_value):
-        if isinstance(field_value, str):
-            try:
-                if field_value.startswith('[') and field_value.endswith(']'):
-                    return eval(field_value)
-                else:
-                    return [field_value]
-            except:
-                return [field_value]
-        elif isinstance(field_value, list):
-            return field_value
-        else:
-            return [str(field_value)] if field_value is not None else []
-
-class SocialMediaPerformancePredictor:
-    def __init__(self):
-        self.tier_benchmarks = {
-            'Nano': {'engagement': 0.04, 'views': 5000},
-            'Micro': {'engagement': 0.02, 'views': 25000},
-            'Mid': {'engagement': 0.015, 'views': 75000},
-            'Macro': {'engagement': 0.012, 'views': 200000},
-            'Mega': {'engagement': 0.01, 'views': 500000}
-        }
-
-    def predict_campaign_performance(self, influencer_data, brand_data):
-        engagement_score = self.calculate_engagement_score(influencer_data)
-        authenticity_score = self.calculate_authenticity_score(influencer_data)
-        reach_potential = self.calculate_reach_potential(influencer_data)
-        brand_fit = self.calculate_brand_fit(influencer_data, brand_data)
-        performance_score = (
-            engagement_score * 0.3 +
-            authenticity_score * 0.25 +
-            reach_potential * 0.25 +
-            brand_fit * 0.2
-        )
-        return {
-            'performance_score': min(performance_score, 1.0),
-            'engagement_score': engagement_score,
-            'authenticity_score': authenticity_score,
-            'reach_potential': reach_potential,
-            'brand_fit': brand_fit
-        }
-
-    def calculate_engagement_score(self, influencer_data):
-        er = influencer_data.get('engagement_rate_pct', 0)
-        tier = influencer_data.get('tier_followers', 'Micro')
-        benchmark = self.tier_benchmarks.get(tier, {'engagement': 0.02})['engagement']
-        normalized_er = min(er / benchmark, 2.0) if benchmark > 0 else 0
-        return normalized_er / 2.0
-
-    def calculate_authenticity_score(self, influencer_data):
-        endorse_rate = influencer_data.get('random_endorse_rate', 0.5)
-        consistency = influencer_data.get('behavior_consistency', False)
-        authenticity = (1 - endorse_rate) * 0.7
-        if consistency:
-            authenticity += 0.3
-        return min(authenticity, 1.0)
-
-    def calculate_reach_potential(self, influencer_data):
-        avg_views = influencer_data.get('avg_reels_views', 0)
-        trending = influencer_data.get('trending_status', False)
-        tier = influencer_data.get('tier_followers', 'Micro')
-        benchmark = self.tier_benchmarks.get(tier, {'views': 25000})['views']
-        view_score = min(avg_views / benchmark, 2.0) / 2.0 if benchmark > 0 else 0
-        if trending:
-            view_score *= 1.2
-        return min(view_score, 1.0)
-
-    def calculate_brand_fit(self, influencer_data, brand_data):
-        infl_expertise = influencer_data.get('expertise_field', '').lower()
-        brand_industry = brand_data.get('industry', '').lower()
-        industry_keywords = {
-            'fmcg': ['lifestyle', 'beauty', 'food', 'health'],
-            'beauty': ['beauty', 'skincare', 'makeup', 'lifestyle'],
-            'health': ['health', 'fitness', 'lifestyle', 'wellness'],
-            'fashion': ['fashion', 'lifestyle', 'beauty'],
-            'food': ['food', 'lifestyle', 'cooking']
-        }
-        relevant_keywords = industry_keywords.get(brand_industry, ['lifestyle'])
-        if infl_expertise in relevant_keywords:
-            return 0.8
-        elif 'lifestyle' in infl_expertise:
-            return 0.6
-        else:
-            return 0.4
-
-class MultiObjectiveRanker:
-    def __init__(self):
-        self.main_objectives = ['demo_fit', 'performance_pred', 'budget_efficiency']
-        self.placeholder_objectives = ['persona_fit']
-
-    def rank_influencers(self, scored_influencers, brand_priorities):
-        if not scored_influencers:
-            return []
-        for obj in self.main_objectives:
-            scores = [infl[obj] for infl in scored_influencers]
-            if scores:
-                min_score, max_score = min(scores), max(scores)
-                for infl in scored_influencers:
-                    if max_score > min_score:
-                        infl[f'{obj}_normalized'] = (infl[obj] - min_score) / (max_score - min_score)
-                    else:
-                        infl[f'{obj}_normalized'] = 0.5
-        for obj in self.placeholder_objectives:
-            for infl in scored_influencers:
-                infl[f'{obj}_normalized'] = infl[obj]
-        all_objectives = self.main_objectives + self.placeholder_objectives
-        for infl in scored_influencers:
-            final_score = sum(
-                infl[f'{obj}_normalized'] * brand_priorities.get(obj, 0.25)
-                for obj in all_objectives
-            )
-            infl['final_score'] = final_score
-        return sorted(scored_influencers, key=lambda x: x['final_score'], reverse=True)
-
-class SOTAInfluencerMatcher:
-    def __init__(self):
-        self.budget_optimizer = BudgetOptimizer()
-        self.persona_matcher = PersonaSemanticMatcher()
-        self.demo_psycho_matcher = DemoPsychoMatcher()
-        self.performance_predictor = SocialMediaPerformancePredictor()
-        self.final_ranker = MultiObjectiveRanker()
-
-# --- Ganti fungsi utama dengan pipeline notebook ---
-@st.cache_data # Tambahkan cache untuk fungsi ini jika hasilnya deterministik dan berat
-def get_top_influencers_for_brand(brand_name, brands_df, influencers_df, bio_df, caption_df, top_n=3):
-    matcher = SOTAInfluencerMatcher()
-    brand_data = brands_df[brands_df['brand_name'] == brand_name]
-    if brand_data.empty:
-        return []
-    brand = brand_data.iloc[0]
-    affordable_influencers = matcher.budget_optimizer.filter_and_optimize(
-        brand['budget'], influencers_df
-    )
-    if affordable_influencers.empty:
-        return []
-    persona_scores_df = matcher.persona_matcher.get_scored_df(
-        brand_persona_text=brand['brand_criteria'],
-        bio_df=bio_df[['instagram_account', 'bio']],
-        caption_df=caption_df
-    )
-    affordable_influencers = pd.merge(
-        affordable_influencers,
-        persona_scores_df.rename(columns={'persona_fit_score': 'persona_fit'}),
-        left_on='username_instagram',
-        right_on='instagram_account',
-        how='left'
-    )
-    affordable_influencers['persona_fit'] = affordable_influencers['persona_fit'].fillna(0.5)
-    scored_influencers = []
-    for _, infl in affordable_influencers.iterrows():
-        persona_score = infl.get('persona_fit', 0.5)
-        demo_score = matcher.demo_psycho_matcher.calculate_demographic_similarity(
-            brand.to_dict(), infl.to_dict()
-        )
-        performance = matcher.performance_predictor.predict_campaign_performance(
-            infl.to_dict(), brand.to_dict()
-        )
-        scored_influencers.append({
-            'brand': brand['brand_name'],
-            'influencer': infl['username_instagram'],
-            'influencer_id': infl['influencer_id'],
-            'tier': infl['tier_followers'],
-            'persona_fit': persona_score,
-            'demo_fit': demo_score,
-            'performance_pred': performance['performance_score'],
-            'budget_efficiency': infl['budget_efficiency'],
-            'optimal_content_mix': infl['optimal_content_mix'],
-            'engagement_rate': infl['engagement_rate_pct'],
-            'authenticity_score': performance['authenticity_score'],
-            'reach_potential': performance['reach_potential'],
-            'brand_fit': performance['brand_fit'],
-            'raw_influencer_data': infl.to_dict()
-        })
-    brand_priorities = {
-        'persona_fit': 0.1,
-        'demo_fit': 0.45,
-        'performance_pred': 0.35,
-        'budget_efficiency': 0.1
-    }
-    final_rankings = matcher.final_ranker.rank_influencers(scored_influencers, brand_priorities)
-    top_recommendations = final_rankings[:top_n]
-    return top_recommendations
-
-# --- Streamlit Layout & Interaction ---
-
+# --- Streamlit Layout ---
 with st.sidebar:
     st.header("Brand Selection")
     brand_name = st.selectbox("Pilih Brand", brands["brand_name"].unique())
     top_n = st.slider("Top N Influencer", 1, 5, 3)
     show_detail = st.checkbox("Tampilkan detail proses", value=True)
 
-# --- Main Output Trigger ---
+# --- Main Output ---
 if st.button("Tampilkan Rekomendasi"):
     with st.spinner("🔎 Mencari influencer terbaik..."):
         # --- Proses ---
         st.markdown(f"""
-**🎯 Finding top {top_n} influencers for: {brand_name}** **💰 Budget:** Rp {int(brands[brands['brand_name']==brand_name]['budget'].iloc[0]):,}  
+**🎯 Finding top {top_n} influencers for: {brand_name}**  
+**💰 Budget:** Rp {int(brands[brands['brand_name']==brand_name]['budget'].iloc[0]):,}  
 **🎪 Industry:** {brands[brands['brand_name']==brand_name]['industry'].iloc[0]}  
 **📝 Criteria:** {brands[brands['brand_name']==brand_name]['brand_criteria'].iloc[0]}  
 {'-'*60}
@@ -562,14 +721,14 @@ if st.button("Tampilkan Rekomendasi"):
                     show_plot=True
                 )
                 st.markdown(insight, unsafe_allow_html=True)
-                if fig: # Hanya panggil st.pyplot jika fig memang ada
+                if fig:
                     st.pyplot(fig, clear_figure=True)
                 # Tabs for detail
                 with st.expander("🔎 Detail & Metrics"):
                     tab1, tab2 = st.tabs(["Score Breakdown", "Campaign Plan"])
                     with tab1:
                         st.markdown(f"""
-- <span class='score-badge'>Budget Efficiency:</span> {rec['budget_efficiency']:.2f} points/Million Rp  
+- <span class='score-badge'>Budget Efficiency:</span> {rec['budget_efficiency'] * 1000000:.2f} points/Million Rp
 - <span class='score-badge'>Persona Fit:</span> {rec['persona_fit']:.1%}  
 - <span class='score-badge'>Demographic Fit:</span> {rec['demo_fit']:.1%}  
 - <span class='score-badge'>Performance:</span> {rec['performance_pred']:.1%}
@@ -608,8 +767,8 @@ if st.button("Tampilkan Rekomendasi"):
                             st.write(f"- Reels: {mix['reels_count']} posts")
                         st.markdown("**💳 Financial Summary:**")
                         st.markdown(f"""
-- Total Investment:     Rp {mix['total_cost']:,}  
-- Budget Remaining:     Rp {mix['remaining_budget']:,}  
-- Expected Impact:      {mix['total_impact']:.1f} points
+- Total Investment:      Rp {mix['total_cost']:,}  
+- Budget Remaining:      Rp {mix['remaining_budget']:,}  
+- Expected Impact:       {mix['total_impact']:.1f} points
 """)
         st.markdown(f"<div class='divider'></div>", unsafe_allow_html=True)
