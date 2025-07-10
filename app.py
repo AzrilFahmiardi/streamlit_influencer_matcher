@@ -370,8 +370,8 @@ class SocialMediaPerformancePredictor:
 
 class MultiObjectiveRanker:
     def __init__(self):
-        self.main_objectives = ['demo_fit', 'performance_pred', 'budget_efficiency']
-        self.placeholder_objectives = ['persona_fit']
+        self.main_objectives = ['demo_fit', 'performance_pred', 'budget_efficiency', 'persona_fit']
+        self.placeholder_objectives = []
 
     def rank_influencers(self, scored_influencers, brand_priorities):
         if not scored_influencers:
@@ -413,7 +413,7 @@ class SOTAInfluencerMatcher:
         self.final_ranker = MultiObjectiveRanker()
 
 # --- Main function (Exact copy from notebook) ---
-def get_top_influencers_for_brand(brand_name, brands_df, influencers_df, bio_df, caption_df, top_n=3):
+def get_top_influencers_for_brand(brand_name, brands_df, influencers_df, bio_df, caption_df, top_n=3, brand_priorities=None):
     """
     Get top N influencer recommendations for a specific brand using SOTA pipeline
     """
@@ -489,12 +489,13 @@ def get_top_influencers_for_brand(brand_name, brands_df, influencers_df, bio_df,
         })
 
     # Stage 5: Final ranking with exact notebook priorities
-    brand_priorities = {
-        'persona_fit': 0.1,       # Reduced since placeholder (NOTEBOOK VERSION)
-        'demo_fit': 0.45,         # High importance
-        'performance_pred': 0.35, # High importance
-        'budget_efficiency': 0.1  # Budget optimization
-    }
+    if brand_priorities is None:
+        brand_priorities = {
+            'persona_fit': 0.25,
+            'demo_fit': 0.25,
+            'performance_pred': 0.25,
+            'budget_efficiency': 0.25
+        }
 
     final_rankings = matcher.final_ranker.rank_influencers(scored_influencers, brand_priorities)
 
@@ -674,6 +675,63 @@ with st.sidebar:
     brand_name = st.selectbox("Pilih Brand", brands["brand_name"].unique())
     top_n = st.slider("Top N Influencer", 1, 5, 3)
     show_detail = st.checkbox("Tampilkan detail proses", value=True)
+    
+    strategy = st.selectbox(
+        "Pilih Skema Prioritas Brand",
+        ("Balanced", "Targeted Campaign", "Awareness Campaign", "Cost Efficiency", "Persona-Centric Brand")
+    )
+
+    if strategy == "Balanced":
+        brand_priorities = {
+            'persona_fit': 0.25,
+            'demo_fit': 0.25,
+            'performance_pred': 0.25,
+            'budget_efficiency': 0.25
+        }
+    elif strategy == "Targeted Campaign":
+        brand_priorities = {
+            'persona_fit': 0.1,
+            'demo_fit': 0.45,
+            'performance_pred': 0.35,
+            'budget_efficiency': 0.1
+        }
+    elif strategy == "Awareness Campaign":
+        brand_priorities = {
+            'persona_fit': 0.3,
+            'demo_fit': 0.2,
+            'performance_pred': 0.4,
+            'budget_efficiency': 0.1
+        }
+    elif strategy == "Cost Efficiency":
+        brand_priorities = {
+            'persona_fit': 0.1,
+            'demo_fit': 0.2,
+            'performance_pred': 0.3,
+            'budget_efficiency': 0.4
+        }
+    elif strategy == "Persona-Centric Brand":
+        brand_priorities = {
+            'persona_fit': 0.4,
+            'demo_fit': 0.25,
+            'performance_pred': 0.25,
+            'budget_efficiency': 0.1
+        }
+        
+    priority_labels = {
+        'persona_fit': "Persona Fit",
+        'demo_fit': "Demographic Fit",
+        'performance_pred': "Performance",
+        'budget_efficiency': "Budget Efficiency"
+    }
+
+    priority_table = "| Komponen | Bobot |\n|:--|:--|\n"
+    for key, label in priority_labels.items():
+        val = brand_priorities.get(key, 0)
+        priority_table += f"| {label} | `{val*100:.0f}%` |\n"
+
+    st.markdown(f"📊 Skema Terpilih: {strategy}")
+    st.write("🔢 Bobot Prioritas:")
+    st.markdown(priority_table, unsafe_allow_html=True)
 
 # --- Main Output ---
 if st.button("Tampilkan Rekomendasi"):
@@ -699,14 +757,49 @@ if st.button("Tampilkan Rekomendasi"):
         st.markdown(f"#### 🏢 <span style='color:#1DA1F2'>{brand_name.upper()}</span> <span class='score-badge'>Budget: Rp {int(brands[brands['brand_name']==brand_name]['budget'].iloc[0]):,}</span>", unsafe_allow_html=True)
         st.markdown(generate_brand_summary(brands, brand_name))
         st.markdown(f"</div>", unsafe_allow_html=True)
+        
         st.markdown(f"<div class='divider'></div>", unsafe_allow_html=True)
+        st.markdown(f"**📊 Skema Prioritas Terpilih** `{strategy}`", unsafe_allow_html=True)
+        priority_labels = {
+            'persona_fit': "🧑‍🎤 Persona Fit",
+            'demo_fit': "👥 Demographic Fit",
+            'performance_pred': "📈 Performance",
+            'budget_efficiency': "💸 Budget Efficiency"
+        }
+
+        priority_table_html = """
+        <table style="width:100%; border-collapse:collapse; margin-bottom:1em;">
+            <tr>
+                <th style="text-align:left; padding:8px 12px;">🧑‍🎤 Persona Fit</th>
+                <th style="text-align:left; padding:8px 12px;">👥 Demographic Fit</th>
+                <th style="text-align:left; padding:8px 12px;">📈 Performance</th>
+                <th style="text-align:left; padding:8px 12px;">💸 Budget Efficiency</th>
+            </tr>
+            <tr>
+                <td style="padding:8px 12px;">{:.0f}%</td>
+                <td style="padding:8px 12px;">{:.0f}%</td>
+                <td style="padding:8px 12px;">{:.0f}%</td>
+                <td style="padding:8px 12px;">{:.0f}%</td>
+            </tr>
+        </table>
+        """.format(
+            brand_priorities.get('persona_fit', 0) * 100,
+            brand_priorities.get('demo_fit', 0) * 100,
+            brand_priorities.get('performance_pred', 0) * 100,
+            brand_priorities.get('budget_efficiency', 0) * 100
+        )
+
+        st.markdown("🔢 **Bobot Prioritas**", unsafe_allow_html=True)
+        st.markdown(priority_table_html, unsafe_allow_html=True)
+        st.markdown(f"<div class='divider'></div>", unsafe_allow_html=True)
+        
         st.markdown(f"<div class='section-card'>", unsafe_allow_html=True)
         st.markdown(f"### 🏆 Top {top_n} Influencer Recommendations", unsafe_allow_html=True)
         st.markdown(f"</div>", unsafe_allow_html=True)
 
         cols = st.columns(top_n)
         top_recommendations = get_top_influencers_for_brand(
-            brand_name, brands, influencers, bio, labeled_caption, top_n=top_n
+            brand_name, brands, influencers, bio, labeled_caption, top_n=top_n, brand_priorities=brand_priorities
         )
         for i, (col, rec) in enumerate(zip(cols, top_recommendations), 1):
             with col:
